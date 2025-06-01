@@ -18,6 +18,13 @@ class Schedule(nn.Module, abc.ABC):
     def sigma(self, t):
         pass
 
+    def beta(self, t):
+        # Note: Only works for variance-preserving noise schedules
+        return -2 * self.alpha_dot(t) / self.alpha(t)
+
+    def lambda_(self, t):  # log(signal-to-noise ratio)
+        return torch.log(self.alpha(t) ** 2 / self.sigma(t) ** 2)
+
     def alpha_dot(self, t):
         t = t.detach().clone().requires_grad_(True)
         alpha = self.alpha(t)
@@ -30,8 +37,11 @@ class Schedule(nn.Module, abc.ABC):
         sigma.backward(torch.ones_like(sigma))
         return t.grad
 
-    def beta(self, t):
-        return -2 * self.alpha_dot(t) / self.alpha(t)
+    def lambda_dot(self, t):
+        t = t.detach().clone().requires_grad_(True)
+        lambda_ = self.lambda_(t)
+        lambda_.backward(torch.ones_like(lambda_))
+        return t.grad
 
 
 class VariancePreserving(Schedule):
@@ -62,7 +72,7 @@ class VarianceExploding(Schedule):
         return torch.ones_like(t)
 
     def sigma(self, t):
-        return t * self.sigma_max
+        return t * self.sigma_max + 1e-5
 
 
 class FlowMatching(Schedule):

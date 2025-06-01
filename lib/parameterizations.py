@@ -37,6 +37,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from . import schedules
+
 
 class Parameterization(nn.Module, abc.ABC):
 
@@ -46,21 +48,37 @@ class Parameterization(nn.Module, abc.ABC):
 
     @abc.abstractmethod
     def x0(self, x, t):
+        # Target in "Elucidating the design space ..."
         pass
 
     @abc.abstractmethod
     def epsilon(self, x, t):
+        # Target in "Denoising Diffusion ..."
         pass
         
     def v(self, x, t):
         # Target in "Progressive distillation ..."
-        alpha = self.schedule.alpha(t)
-        sigma = self.schedule.sigma(t)
-        return alpha * self.epsilon(x, t) - sigma * self.x0(x, t)
+        alpha = self.schedule.alpha
+        sigma = self.schedule.sigma
+        return alpha(t) * self.epsilon(x, t) - sigma(t) * self.x0(x, t)
 
     def u(self, x, t):
-        # Target in "Scaling Rectified Flow ..."
+        # Target in "Scaling Rectified Flow ..." and "Flow Matching for ..."
+        # This is the dx/dt when using conditional flow matching's noise schedule.
         return self.epsilon(x, t) - self.x0(x, t)
+
+    def score(self, x, t):
+        return -1 * self.epsilon(x, t) / self.schedule.sigma(t)
+
+    def dx_dt(self, x, t):
+        # Note: The following is functionally correct but numerically unstable.
+        s = self.schedule
+        w_x = s.alpha_dot(t) / s.alpha(t)
+        w_epsilon = s.sigma(t) * (
+            s.sigma_dot(t) / s.sigma(t) 
+            - s.alpha_dot(t) * s.sigma(t) / (s.alpha(t) ** 2)
+        )
+        return w_x * x + w_epsilon * self.epsilon(x, t)
 
 
 class Epsilon(Parameterization):
@@ -70,15 +88,21 @@ class Epsilon(Parameterization):
         self.model = model
 
     def epsilon(self, x, t):
-        # Target in "Denoising Diffusion ..."
         return self.model(x, t)
 
     def x0(self, x, t):
-        # Target in "Elucidating the design space ..."
         epsilon = self.epsilon(x, t)
-        alpha = self.schedule.alpha(t)
-        sigma = self.schedule.sigma(t)
-        return (x - sigma * epsilon) / alpha
+        alpha = self.schedule.alpha
+        sigma = self.schedule.sigma
+        return (x - sigma(t) * epsilon) / alpha(t)
+
+    def dx_dt(self, x, t):
+        if not isinstance(self.schedule, schedules.VariancePreserving):
+            return super(Epsilon, self).dx_dt(x, t)
+        # ODE from "Score-Based Generative Modeling ..."
+        # Note: This is dx/dt when using a variance-preserving noise schedule.
+        s = self.schedule
+        return -0.5 * s.beta(t) * x - 0.5 * s.beta(t) * self.score(x, t)
 
 
 class X0(Parameterization):
@@ -89,10 +113,43 @@ class X0(Parameterization):
         self.schedule = schedule
 
     def epsilon(self, x, t):
+        s = self.schedule
         x0 = self.x0(x, t)
-        alpha = self.schedule.alpha(t)
-        sigma = self.schedule.sigma(t)
-        return (xt - alpha * x0) / sigma
+        return (x - s.alpha(t) * x0) / s.sigma(t)
 
     def x0(self, x, t):
         return self.model(x, t)
+
+    def dx_dt(self, x, t):
+        if not isinstance(self.schedule, schedules.VarianceExploding):
+            return super(X0, self).dx_dt(x, t)
+        # ODE from "Elucidating ..."
+        # Note: This is dx/dt when alpha(t) = 1.0 and sigma(t) increases.
+        s = self.schedule
+        return self.epsilon(x, t) * s.sigma_dot(t)
+
+
+class U(Parameterization):
+
+    def __init__(self, model, schedule):
+        super(U, self).__init__(schedule)
+        self.model = model
+        self.schedule = schedule
+
+    def x0(self, x, t):
+        sigma = self.schedule.sigma
+        return x - sigma(t) * self.u(x, t)
+
+    def epsilon(self, x, t):
+        alpha = self.schedule.alpha
+        return x + alpha(t) * self.u(x, t)
+
+    def u(self, x, t):
+        return self.model(x, t)
+
+    def dx_dt(self, x, t):
+        if not isinstance(self.schedule, schedules.FlowMatching):
+            return super(U, self).dx_dt(x, t)
+        # ODE from "Flow Matching for ..."
+        # Note: This is dx/dt when alpha(t) = 1 - t and sigma(t) = 1.0
+        return self.u(x, t)
